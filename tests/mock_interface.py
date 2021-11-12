@@ -5,6 +5,8 @@ from coax.interface import Interface
 
 class MockInterface(Interface):
     def __init__(self, responses=[]):
+        super().__init__()
+
         self.mock_responses = responses
 
         self.serial = Mock(port='/dev/mock')

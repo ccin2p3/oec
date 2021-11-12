@@ -27,7 +27,7 @@ emulation.
 
 ## Supported Terminals
 
-Only directly attached CUT (Control Unit Terminal) type terminals are supported. I have tested oec with the following terminals:
+Only CUT (Control Unit Terminal) type terminals are supported. I have tested oec with the following terminals:
 
   * IBM 3278-2
   * IBM 3472

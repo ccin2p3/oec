@@ -9,6 +9,7 @@ import logging
 from more_itertools import chunked
 from coax import read_feature_ids, parse_features, ReadTerminalId, ReadExtendedId, \
                  Feature, ProtocolError
+from coax.multiplexer import PORT_MAP_3299
 
 logger = logging.getLogger(__name__)
 
@@ -69,7 +70,10 @@ def format_address(interface, device_address):
     if device_address is None:
         return interface.identifier
 
-    raise NotImplementedError
+    try:
+        return f'{interface.identifier}#{PORT_MAP_3299.index(device_address)}'
+    except ValueError:
+        return f'{interface.identifier}?{device_address:06b}'
 
 def get_ids(interface, device_address, extended_id_retry_attempts=3):
     terminal_id = None

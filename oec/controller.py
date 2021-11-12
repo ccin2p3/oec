@@ -6,7 +6,9 @@ oec.controller
 import time
 import logging
 import selectors
-from coax import Poll, PollAck, KeystrokePollResponse, ReceiveTimeout
+from coax import InterfaceFeature, Poll, PollAck, KeystrokePollResponse, ReceiveTimeout, \
+                 get_device_address
+from coax.multiplexer import PORT_MAP_3299
 
 from .device import address_commands, format_address, UnsupportedDeviceError
 from .keyboard import Key
@@ -25,6 +27,7 @@ class Controller:
         self.create_session = create_session
 
         self.device = None
+        self.detatched_device_poll_queue = []
 
         self.session = None
         self.session_selector = None
@@ -36,7 +39,7 @@ class Controller:
         # with TT/AR to the last poll - this is an effort to improve the keystroke
         # responsiveness.
         self.attached_poll_period = 1 / 10
-        self.detatached_poll_period = 5
+        self.detatached_poll_period = 1
 
         self.last_poll_time = None
         self.last_poll_response = None
@@ -75,7 +78,7 @@ class Controller:
 
         # POLL devices.
         self._poll_attached_device()
-        self._poll_detatched_device()
+        self._poll_next_detatched_device()
 
     def _update_session(self, duration):
         try:
@@ -146,13 +149,19 @@ class Controller:
 
         self.last_poll_response = poll_response
 
-    def _poll_detatched_device(self):
+    def _poll_next_detatched_device(self):
         if self.device:
             return
 
         self.last_poll_time = time.perf_counter()
 
-        device_address = None
+        if not self.detatched_device_poll_queue:
+            self.detatched_device_poll_queue = list(self._get_detatched_device_addresses())
+
+        try:
+            device_address = self.detatched_device_poll_queue.pop(0)
+        except IndexError:
+            return
 
         try:
             poll_response = self._poll(device_address)
@@ -245,3 +254,19 @@ class Controller:
             period = self.detatached_poll_period
 
         return max((self.last_poll_time + period) - current_time, 0)
+
+    def _get_detatched_device_addresses(self):
+        # The 3299 is transparent, but if there is at least one device attached to a 3299
+        # port then we can assume there is a 3299 attached.
+        is_3299_attached = self.device is not None and self.device.device_address is not None
+
+        if InterfaceFeature.PROTOCOL_3299 not in self.interface.features:
+            addresses = [None]
+        elif is_3299_attached:
+            addresses = PORT_MAP_3299
+        else:
+            addresses = [None, *PORT_MAP_3299]
+
+        attached_devices = set([self.device.device_address] if self.device is not None else [])
+
+        return filter(lambda address: address not in attached_devices, addresses)
