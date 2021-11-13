@@ -26,7 +26,7 @@ class Controller:
         self.create_device = create_device
         self.create_session = create_session
 
-        self.device = None
+        self.devices = { }
         self.detatched_device_poll_queue = []
 
         self.session = None
@@ -38,11 +38,13 @@ class Controller:
         # The attached poll period only applies in cases where the device responded
         # with TT/AR to the last poll - this is an effort to improve the keystroke
         # responsiveness.
-        self.attached_poll_period = 1 / 10
-        self.detatached_poll_period = 1
+        self.attached_poll_period = 1 / 15
+        self.detatched_poll_period = 1 / 2
 
-        self.last_poll_time = None
-        self.last_poll_response = None
+        self.poll_depth = 3
+
+        self.last_attached_poll_time = None
+        self.last_detatched_poll_time = None
 
     def run(self):
         """Run the controller."""
@@ -59,15 +61,14 @@ class Controller:
 
         self.session_selector = None
 
-        if self.device:
-            self.device = None
+        self.devices = { }
 
     def stop(self):
         """Stop the controller."""
         self.running = False
 
     def _run_loop(self):
-        poll_delay = self._calculate_poll_delay(time.perf_counter())
+        poll_delay = self._calculate_poll_delay()
 
         # If POLLing is delayed, handle the host output, otherwise just sleep.
         if poll_delay > 0:
@@ -77,7 +78,7 @@ class Controller:
                 time.sleep(poll_delay)
 
         # POLL devices.
-        self._poll_attached_device()
+        self._poll_attached_devices()
         self._poll_next_detatched_device()
 
     def _update_session(self, duration):
@@ -105,8 +106,8 @@ class Controller:
         except SessionDisconnectedError:
             self._handle_session_disconnected()
 
-    def _start_session(self):
-        self.session = self.create_session(self.device)
+    def _start_session(self, device):
+        self.session = self.create_session(device)
 
         self.session.start()
 
@@ -125,35 +126,37 @@ class Controller:
     def _handle_session_disconnected(self):
         self.logger.info('Session disconnected')
 
+        device = self.session.terminal
+
         self._terminate_session()
 
         # Restart the session.
-        self._start_session()
+        self._start_session(device)
 
-    def _poll_attached_device(self):
-        if not self.device:
-            return
+    def _poll_attached_devices(self):
+        self.last_attached_poll_time = time.perf_counter()
 
-        self.last_poll_time = time.perf_counter()
+        for device in self.devices.values():
+            for _ in range(self.poll_depth):
+                print('.')
+                try:
+                    poll_response = device.poll()
+                except ReceiveTimeout:
+                    self._handle_device_lost(device)
+                    return
 
-        try:
-            poll_response = self.device.poll()
-        except ReceiveTimeout:
-            self._handle_device_lost()
-            return
+                if not poll_response:
+                    break
 
-        if poll_response:
-            self._poll_ack(self.device.device_address)
+                self._poll_ack(device.device_address)
 
-            self._handle_poll_response(poll_response)
-
-        self.last_poll_response = poll_response
+                self._handle_poll_response(device, poll_response)
 
     def _poll_next_detatched_device(self):
-        if self.device:
+        if self.last_detatched_poll_time is not None and (time.perf_counter() - self.last_detatched_poll_time) < self.detatched_poll_period:
             return
 
-        self.last_poll_time = time.perf_counter()
+        self.last_detatched_poll_time = time.perf_counter()
 
         if not self.detatched_device_poll_queue:
             self.detatched_device_poll_queue = list(self._get_detatched_device_addresses())
@@ -173,8 +176,6 @@ class Controller:
 
         self._handle_device_found(device_address, poll_response)
 
-        self.last_poll_response = poll_response
-
     def _handle_device_found(self, device_address, poll_response):
         self.logger.info(f'Found device @ {format_address(self.interface, device_address)}')
 
@@ -186,29 +187,28 @@ class Controller:
 
         device.setup()
 
-        self.device = device
+        self.devices[device_address] = device
 
         self.logger.info(f'Attached device @ {format_address(self.interface, device_address)}')
 
-        self._start_session()
+        self._start_session(device)
 
-    def _handle_device_lost(self):
-        device_address = self.device.device_address
+    def _handle_device_lost(self, device):
+        device_address = device.device_address
 
         self.logger.info(f'Lost device @ {format_address(self.interface, device_address)}')
 
         self._terminate_session()
 
-        self.device = None
+        del self.devices[device_address]
 
         self.logger.info(f'Detached device @ {format_address(self.interface, device_address)}')
 
-    def _handle_poll_response(self, poll_response):
+    def _handle_poll_response(self, device, poll_response):
         if isinstance(poll_response, KeystrokePollResponse):
-            self._handle_keystroke_poll_response(poll_response)
+            self._handle_keystroke_poll_response(device, poll_response)
 
-    def _handle_keystroke_poll_response(self, poll_response):
-        terminal = self.device
+    def _handle_keystroke_poll_response(self, terminal, poll_response):
         scan_code = poll_response.scan_code
 
         (key, modifiers, modifiers_changed) = terminal.keyboard.get_key(scan_code)
@@ -241,24 +241,18 @@ class Controller:
     def _poll_ack(self, device_address):
         self.interface.execute(address_commands(device_address, PollAck()))
 
-    def _calculate_poll_delay(self, current_time):
-        if self.last_poll_response is not None:
+    def _calculate_poll_delay(self):
+        if self.last_attached_poll_time is None:
             return 0
 
-        if self.last_poll_time is None:
-            return 0
-
-        if self.device:
-            period = self.attached_poll_period
-        else:
-            period = self.detatached_poll_period
-
-        return max((self.last_poll_time + period) - current_time, 0)
+        return max((self.last_attached_poll_time + self.attached_poll_period) - time.perf_counter(), 0)
 
     def _get_detatched_device_addresses(self):
+        attached_addresses = set(self.devices.keys())
+
         # The 3299 is transparent, but if there is at least one device attached to a 3299
         # port then we can assume there is a 3299 attached.
-        is_3299_attached = self.device is not None and self.device.device_address is not None
+        is_3299_attached = any(attached_addresses.difference([None]))
 
         if InterfaceFeature.PROTOCOL_3299 not in self.interface.features:
             addresses = [None]
@@ -267,6 +261,4 @@ class Controller:
         else:
             addresses = [None, *PORT_MAP_3299]
 
-        attached_devices = set([self.device.device_address] if self.device is not None else [])
-
-        return filter(lambda address: address not in attached_devices, addresses)
+        return filter(lambda address: address not in attached_addresses, addresses)

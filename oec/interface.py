@@ -20,7 +20,7 @@ class InterfaceWrapper:
     def __init__(self, interface):
         self.interface = interface
 
-        self.timeout = 0.1
+        self.timeout = 0.001
 
         self.jumbo_write_strategy = _get_jumbo_write_strategy()
         self.jumbo_write_max_length = None
