@@ -71,9 +71,10 @@ class VT100Session(Session):
     """VT100 session."""
 
     def __init__(self, terminal, host_command):
+        super().__init__(terminal)
+
         self.logger = logging.getLogger(__name__)
 
-        self.terminal = terminal
         self.host_command = host_command
         self.host_process = None
 

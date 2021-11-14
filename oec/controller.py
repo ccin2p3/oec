@@ -14,6 +14,42 @@ from .device import address_commands, format_address, UnsupportedDeviceError
 from .keyboard import Key
 from .session import SessionDisconnectedError
 
+# vvv
+import math
+class PerformanceCounter:
+    def __init__(self):
+        self.epoch = None
+        self.loop_count = 0
+        self.session_times = []
+        self.attached_poll_times = []
+        self.detatched_poll_count = 0
+
+    def reset(self):
+        self.epoch = time.perf_counter()
+        self.loop_count = 0
+        self.session_times = []
+        self.attached_poll_times = []
+        self.detatched_poll_count = 0
+
+    def dump(self):
+        x = time.perf_counter() - self.epoch
+
+        loops_per_second = math.floor(self.loop_count / x)
+
+        avg_session_time = sum(self.session_times) / len(self.session_times) * 1000
+        avg_attached_poll_time = sum(self.attached_poll_times) / len(self.attached_poll_times) * 1000
+
+        print(f'time             = {x:.1f} s')
+        print(f'loop_count       = {self.loop_count}')
+        print(f'loops_per_second = {loops_per_second}')
+        print(f'session handling = {avg_session_time:.4f} ms')
+        print(f'attached poll    = {avg_attached_poll_time:.4f} ms')
+        print(f'detatched count  = {self.detatched_poll_count}')
+        print('\n')
+
+PERF = PerformanceCounter()
+# ^^^
+
 class Controller:
     """The controller."""
 
@@ -29,7 +65,7 @@ class Controller:
         self.devices = { }
         self.detatched_device_poll_queue = []
 
-        self.session = None
+        self.sessions = { }
         self.session_selector = None
 
         # Target time between POLL commands in seconds when a device is attached or
@@ -52,16 +88,21 @@ class Controller:
 
         self.session_selector = selectors.DefaultSelector()
 
+        PERF.reset()
         while self.running:
             self._run_loop()
 
-        self._terminate_session()
+        for session in self.sessions.values():
+            self._terminate_session(session)
 
         self.session_selector.close()
 
         self.session_selector = None
 
-        self.devices = { }
+        self.sessions.clear()
+
+        self.devices.clear()
+        self.detatched_device_poll_queue.clear()
 
     def stop(self):
         """Stop the controller."""
@@ -71,64 +112,75 @@ class Controller:
         poll_delay = self._calculate_poll_delay()
 
         # If POLLing is delayed, handle the host output, otherwise just sleep.
+        x = time.perf_counter()
         if poll_delay > 0:
-            if self.session:
-                self._update_session(poll_delay)
+            if self.sessions:
+                self._update_sessions(poll_delay)
             else:
                 time.sleep(poll_delay)
+        PERF.session_times.append(time.perf_counter() - x)
 
         # POLL devices.
+        x = time.perf_counter()
         self._poll_attached_devices()
+        PERF.attached_poll_times.append(time.perf_counter() - x)
         self._poll_next_detatched_device()
 
-    def _update_session(self, duration):
-        try:
-            update_count = 0
+        PERF.loop_count += 1
 
-            while duration > 0:
-                start_time = time.perf_counter()
+        if PERF.loop_count == 200:
+            PERF.dump()
+            PERF.reset()
 
-                selected = self.session_selector.select(duration)
+    def _update_sessions(self, duration):
+        updated_sessions = set()
 
-                if not selected:
-                    break
+        while duration > 0:
+            start_time = time.perf_counter()
 
-                for (key, _) in selected:
-                    session = key.fileobj
+            selected = self.session_selector.select(duration)
 
+            if not selected:
+                break
+
+            for (key, _) in selected:
+                session = key.fileobj
+
+                try:
                     if session.handle_host():
-                        update_count += 1
+                        updated_sessions.add(session)
+                except SessionDisconnectedError:
+                    updated_sessions.discard(session)
 
-                duration -= (time.perf_counter() - start_time)
+                    self._handle_session_disconnected(session)
 
-            if update_count > 0:
-                self.session.render()
-        except SessionDisconnectedError:
-            self._handle_session_disconnected()
+            duration -= (time.perf_counter() - start_time)
+
+        for session in updated_sessions:
+            session.render()
 
     def _start_session(self, device):
-        self.session = self.create_session(device)
+        session = self.create_session(device)
 
-        self.session.start()
+        session.start()
 
-        self.session_selector.register(self.session, selectors.EVENT_READ)
+        self.sessions[device.device_address] = session
 
-    def _terminate_session(self):
-        if not self.session:
-            return
+        self.session_selector.register(session, selectors.EVENT_READ)
 
-        self.session_selector.unregister(self.session)
+    def _terminate_session(self, session):
+        self.session_selector.unregister(session)
 
-        self.session.terminate()
+        session.terminate()
 
-        self.session = None
+        del self.sessions[session.terminal.device_address]
 
-    def _handle_session_disconnected(self):
+    def _handle_session_disconnected(self, session):
         self.logger.info('Session disconnected')
 
-        device = self.session.terminal
+        device = session.terminal
 
-        self._terminate_session()
+        self._terminate_session(session)
 
         # Restart the session.
         self._start_session(device)
@@ -138,7 +190,6 @@ class Controller:
 
         for device in self.devices.values():
             for _ in range(self.poll_depth):
-                print('.')
                 try:
                     poll_response = device.poll()
                 except ReceiveTimeout:
@@ -165,7 +216,7 @@ class Controller:
             device_address = self.detatched_device_poll_queue.pop(0)
         except IndexError:
             return
-
+        PERF.detatched_poll_count += 1
         try:
             poll_response = self._poll(device_address)
         except ReceiveTimeout:
@@ -198,7 +249,10 @@ class Controller:
 
         self.logger.info(f'Lost device @ {format_address(self.interface, device_address)}')
 
-        self._terminate_session()
+        session = self.sessions.get(device_address)
+
+        if session:
+            self._terminate_session(session)
 
         del self.devices[device_address]
 
@@ -224,16 +278,18 @@ class Controller:
         if not key:
             return
 
+        session = self.sessions.get(terminal.device_address)
+
         if key == Key.CURSOR_BLINK:
             terminal.display.toggle_cursor_blink()
         elif key == Key.ALT_CURSOR:
             terminal.display.toggle_cursor_reverse()
         elif key == Key.CLICKER:
             terminal.keyboard.toggle_clicker()
-        elif self.session:
-            self.session.handle_key(key, modifiers, scan_code)
+        elif session:
+            session.handle_key(key, modifiers, scan_code)
 
-            self.session.render()
+            session.render()
 
     def _poll(self, device_address):
         return self.interface.execute(address_commands(device_address, Poll()))
