@@ -53,6 +53,8 @@ class Terminal(Device):
         # Show the attached indicator on the status line.
         self.display.status_line.write_string(0, 'OEC')
 
+        self.display.move_cursor(row=0, column=0)
+
     def poll(self):
         """Execute a POLL command with queued actions."""
         poll_action = PollAction.NONE

@@ -3,11 +3,13 @@ oec.controller
 ~~~~~~~~~~~~~~
 """
 
+from enum import Enum
 import time
 import logging
 import selectors
-from coax import InterfaceFeature, Poll, PollAck, KeystrokePollResponse, ReceiveTimeout, \
-                 get_device_address
+from concurrent import futures
+from itertools import groupby
+from coax import InterfaceFeature, Poll, PollAck, KeystrokePollResponse, ReceiveTimeout
 from coax.multiplexer import PORT_MAP_3299
 
 from .device import address_commands, format_address, UnsupportedDeviceError
@@ -50,6 +52,11 @@ class PerformanceCounter:
 PERF = PerformanceCounter()
 # ^^^
 
+class SessionState(Enum):
+    STARTING = 1
+    ACTIVE = 2
+    TERMINATING = 3
+
 class Controller:
     """The controller."""
 
@@ -67,6 +74,7 @@ class Controller:
 
         self.sessions = { }
         self.session_selector = None
+        self.session_executor = None
 
         # Target time between POLL commands in seconds when a device is attached or
         # no device is attached.
@@ -87,13 +95,18 @@ class Controller:
         self.running = True
 
         self.session_selector = selectors.DefaultSelector()
+        self.session_executor = futures.ThreadPoolExecutor()
 
         PERF.reset()
         while self.running:
             self._run_loop()
 
-        for session in self.sessions.values():
-            self._terminate_session(session)
+        self.session_executor.shutdown(wait=True)
+
+        self.session_executor = None
+
+        for session in [sessionish for (state, sessionish) in self.sessions.values() if state == SessionState.ACTIVE]:
+            self._terminate_session(session, blocking=True)
 
         self.session_selector.close()
 
@@ -114,9 +127,7 @@ class Controller:
         # If POLLing is delayed, handle the host output, otherwise just sleep.
         x = time.perf_counter()
         if poll_delay > 0:
-            if self.sessions:
-                self._update_sessions(poll_delay)
-            else:
+            if not self._update_sessions(poll_delay):
                 time.sleep(poll_delay)
         PERF.session_times.append(time.perf_counter() - x)
 
@@ -133,6 +144,39 @@ class Controller:
             PERF.reset()
 
     def _update_sessions(self, duration):
+        start_time = time.perf_counter()
+
+        # Start any missing sessions.
+        for device_address in self.devices.keys() - self.sessions.keys():
+            self._start_session(self.devices[device_address])
+
+        sessions = { state: [(device_address, sessionish) for (device_address, (_, sessionish)) in group] for (state, group) in groupby(self.sessions.items(), lambda item: item[1][0]) }
+
+        if not sessions:
+            return False
+
+        # Handle started sessions.
+        for (device_address, future) in sessions.get(SessionState.STARTING, []):
+            if future.done():
+                session = future.result()
+
+                self.sessions[device_address] = (SessionState.ACTIVE, session)
+
+                self.session_selector.register(session, selectors.EVENT_READ)
+
+                self.logger.info(f'Session started for device @ {format_address(self.interface, device_address)}')
+
+        # Handle terminated sessions.
+        for (device_address, future) in sessions.get(SessionState.TERMINATING, []):
+            if future.done():
+                del self.sessions[device_address]
+
+                self.logger.info(f'Session terminated for device @ {format_address(self.interface, device_address)}')
+
+        # Update the duration based on the time taken handling futures.
+        duration -= (time.perf_counter() - start_time)
+
+        # Update active sessions.
         updated_sessions = set()
 
         while duration > 0:
@@ -159,31 +203,47 @@ class Controller:
         for session in updated_sessions:
             session.render()
 
+        return True
+
     def _start_session(self, device):
-        session = self.create_session(device)
+        device_address = device.device_address
 
-        session.start()
+        self.logger.info(f'Starting session for device @ {format_address(self.interface, device_address)}')
 
-        self.sessions[device.device_address] = session
+        def start_session():
+            session = self.create_session(device)
 
-        self.session_selector.register(session, selectors.EVENT_READ)
+            session.start()
 
-    def _terminate_session(self, session):
+            return session
+
+        future = self.session_executor.submit(start_session)
+
+        self.sessions[device_address] = (SessionState.STARTING, future)
+
+    def _terminate_session(self, session, blocking=False):
+        device_address = session.terminal.device_address
+
+        self.logger.info(f'Terminating session for device @ {format_address(self.interface, device_address)}')
+
         self.session_selector.unregister(session)
 
-        session.terminate()
+        def terminate_session():
+            session.terminate()
 
-        del self.sessions[session.terminal.device_address]
+        if blocking:
+            terminate_session()
+
+            del self.sessions[device_address]
+        else:
+            future = self.session_executor.submit(terminate_session)
+
+            self.sessions[device_address] = (SessionState.TERMINATING, future)
 
     def _handle_session_disconnected(self, session):
         self.logger.info('Session disconnected')
 
-        device = session.terminal
-
         self._terminate_session(session)
-
-        # Restart the session.
-        self._start_session(device)
 
     def _poll_attached_devices(self):
         self.last_attached_poll_time = time.perf_counter()
@@ -242,8 +302,6 @@ class Controller:
 
         self.logger.info(f'Attached device @ {format_address(self.interface, device_address)}')
 
-        self._start_session(device)
-
     def _handle_device_lost(self, device):
         device_address = device.device_address
 
@@ -278,7 +336,7 @@ class Controller:
         if not key:
             return
 
-        session = self.sessions.get(terminal.device_address)
+        (session_state, session) = self.sessions.get(terminal.device_address)
 
         if key == Key.CURSOR_BLINK:
             terminal.display.toggle_cursor_blink()
@@ -286,7 +344,7 @@ class Controller:
             terminal.display.toggle_cursor_reverse()
         elif key == Key.CLICKER:
             terminal.keyboard.toggle_clicker()
-        elif session:
+        elif session_state == SessionState.ACTIVE:
             session.handle_key(key, modifiers, scan_code)
 
             session.render()
